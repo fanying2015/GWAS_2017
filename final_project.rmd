@@ -1,0 +1,644 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Name: Fanying Tang
+ID: fta2001
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+Part I. Clean up the data
+```{r}
+library(HardyWeinberg)
+library(MASS)
+library(ggplot2)
+library(ggfortify)
+library(plyr)
+library(qqman)
+
+#1. Input the data
+geno_input <- read.csv("./QG17_genotypes.csv",
+                       header = TRUE,
+                       stringsAsFactors = FALSE,
+                       row.names = 1)
+pheno_input <- read.csv("./QG17_phenotypes.csv",
+                        header = TRUE,
+                        stringsAsFactors = FALSE,
+                        row.names = 1)
+covar_input <- read.csv("./QG17_covars.csv",
+                        header = TRUE,
+                        stringsAsFactors = FALSE,
+                        row.names = 1)
+
+SNP_input <- read.csv("./QG17_SNP_info.csv",
+                        header = TRUE,
+                        stringsAsFactors = FALSE)
+
+gene_input <- read.csv("./QG17_gene_info.csv",
+                       header = TRUE,
+                       stringsAsFactors = FALSE)
+gene_name <- colnames(pheno_input)
+
+gene_input_order <- gene_input[match(gene_name, gene_input$probe),]
+
+covar_input <- as.matrix(covar_input)
+covar_transformed <- matrix(NA, ncol = ncol(covar_input), nrow = nrow(covar_input))
+for(i in 1:nrow(covar_input)) {
+  if(covar_input[i,1] == "CEU") {covar_transformed[i,1] = 1}
+  if(covar_input[i,1] == "FIN") {covar_transformed[i,1] = 2}
+  if(covar_input[i,1] == "GBR") {covar_transformed[i,1] = 3}
+  if(covar_input[i,1] == "TSI") {covar_transformed[i,1] = 4}
+  if(covar_input[i,2] == "MALE") {covar_transformed[i,2] = 1}
+  if(covar_input[i,2] == "FEMALE") {covar_transformed[i,2] = -1}
+}
+
+
+
+```
+
+```{r}
+# 2. Check the phenotype
+
+# Plot the phenotype
+par(mfrow=c(2,3))
+dim(pheno_input)
+for(i in 1:ncol(pheno_input)){
+  hist(pheno_input[,i], 
+       main = paste("Histogram of phenotype", gene_input_order$symbol[i]), 
+       xlab = paste("Phenotype",gene_input_order$symbol[i]),
+       probability = TRUE)
+  lines(density(pheno_input[,i])) 
+}
+
+# Make sure all the phenotypes conform a normal distribution
+par(mfrow=c(2,3))
+for(i in 1:ncol(pheno_input)){
+  qqnorm(pheno_input[,i]); qqline(pheno_input[,i])
+}
+```
+
+```{r}
+# 3. Check and Clean the genotypes
+dim(geno_input)
+
+# Clean the genotypes, making sure the genotype number indicates the number of minor alleles
+for(i in 1:ncol(geno_input)) {
+  allele_freq <- sum(geno_input[,i])/(2*length(geno_input[,i]))
+  if(allele_freq >= 0.5) {
+    geno_input[,i] <- 2-geno_input[,i]
+  }
+}
+
+
+# Make sure all the genotype values are 0, 1 or 2
+index <- which(geno_input[]!= 0 & geno_input[]!=1 & geno_input[]!=2)
+
+
+# Remove genotypes with MAF < 5%
+MAF <- apply(geno_input, 2, function(x) sum(x) /(length(x)*2))
+
+x_filter_0 <- geno_input[, which(MAF > 0.05 & MAF <= 0.5)]
+
+dim(x_filter_0)
+# No genotypes were filtered out.
+
+# Remove genotypes that fail a Hardy_weinberg qulibrium test
+allele_count <- apply(x_filter_0, 2, function(x) table(factor(x, lev = 0:2)))
+
+pvalue <- c()
+
+for(i in 1:ncol(x_filter_0)) {
+  pvalue[i] <- HWExact(allele_count[,i], verbose = FALSE)$pval
+}
+
+x_filter <- x_filter_0[,which(pvalue >= 0.05/ncol(x_filter_0))]
+
+dim(x_filter)
+# 277 genotypes were filtered out
+
+# Do a PCA to check the clustering of individuals
+geno_filtered_centered <- scale((x_filter), center = TRUE, scale = FALSE)
+
+pca.result <- prcomp(geno_filtered_centered)
+
+pcs = (pca.result$sdev / sum(pca.result$sdev))*100
+
+plot(x = c(1:50), y = pcs[1:50], main = "Fraction of variation explained by the first 50 PCs")
+plot(x = c(1:50), y = cumsum(pcs)[1:50], main = "Accumulated fraction of variation explained by the first 50 PCs")
+
+autoplot(prcomp(geno_filtered_centered),data = covar_input, colour = 'Population', label = FALSE, label.size = 3) # Population strucuture affects the PC. GBR and CEU are overlapping, while TSI and FIN formed distinct clusters repectively.
+
+autoplot(prcomp(geno_filtered_centered),data = covar_input, colour = 'Sex', label = FALSE, label.size = 3) # Sex doesn't affect the first two PCs.
+
+cor.test(pca.result$x[,1], covar_transformed[,1])
+```
+Part II. Do an association test with linear regression model
+
+```{r}
+# 1. Code the functions for calculating p-values
+# Code for the log-likelihood function
+library(MASS)
+
+lr_likelihood <- function(y, x_input = NULL){
+  n_samples <- length(y)
+  
+  X_mx <- cbind(matrix(1, nrow = n_samples, ncol = 1), x_input)
+  
+  MLE_beta <- ginv(t(X_mx) %*% X_mx) %*% t(X_mx) %*% y
+  
+  y_hat <- X_mx %*% MLE_beta
+  
+  var_hat <- sum((y - (y_hat))^2) / (n_samples - 1)
+  
+  log_likelihood <- -((n_samples / 2) * log(2 * pi * var_hat) ) - ((1/ (2*var_hat)) * sum((y - (y_hat))^2))
+  
+  return(log_likelihood)
+}
+
+# Code the function for LRT and calculating p-values
+LRT_test <- function(logl_H0, logl_HA, df_test){
+  
+  LRT<-2*logl_HA-2*logl_H0 #likelihood ratio test statistic
+  #likelihood ratio test statistic for every genotype
+  pval <- pchisq(LRT, df_test, lower.tail = F)
+  return(pval)
+}
+
+# Code for qqplot
+n_geno <- ncol(x_filter)
+plot_qq<-function(pval_vec, n_geno, title){
+  sorted_pvals <- sort(pval_vec, decreasing = FALSE)
+  sorted_expected <- sort(runif(n_geno), decreasing = FALSE)
+  
+  plot(-log10(sorted_expected), -log10(sorted_pvals), main = paste("QQplot", title), xlab = 'Expected p-values', ylab='Observed p-values')
+  abline(a = 0, b = 1, col = "red")
+}
+```
+
+```{r}
+# 2. Determine how many PCs to be included.
+qqplot_comparision <- function(n_geno = n_geno, m = 1, n = 10){
+  pValues_include <- c()
+  for(i in 1:n_geno) {
+    h0_includecovar <- lr_likelihood(pheno_input[,m], pca.result$x[,1:n])
+    ha_includecovar <- lr_likelihood(pheno_input[,m], cbind(x_filter[,i],pca.result$x[,1:n]))
+    pValues_include <-c(pValues_include, LRT_test(h0_includecovar, ha_includecovar, df_test = 1))
+  }
+  figure <- plot_qq(pval_vec = pValues_include, n_geno, paste(gene_input_order$symbol[m], "with", n, "PC(s)"))
+  return(list(figure = figure, pval = pValues_include))
+}
+
+qqplot_excludecovar <- function(n_geno = n_geno, m = 1){
+  pValues_exclude <- c()
+  for(i in 1:n_geno) {
+    h0_excludecovar <- lr_likelihood(pheno_input[,m],1)
+    ha_excludecovar <- lr_likelihood(pheno_input[,m], x_filter[,i])
+    pValues_exclude <- c(pValues_exclude, LRT_test(h0_excludecovar, ha_excludecovar, df_test = 1))
+  }
+  figure <- plot_qq(pval_vec = pValues_exclude, n_geno, paste(gene_input_order$symbol[m], "without covariates"))
+  return(figure)
+}
+```
+
+```{r}
+# for phenotype 1
+par(mfrow = c(3,4))
+qqplot_excludecovar(n_geno = n_geno, m = 1)
+for(j in 1:10){
+  qqplot_comparision(n_geno, m = 1, n = j)$figure
+}
+# Including 10 PCs is the optimal for phenotype 1
+```
+
+```{r}
+# for phenotype 2
+par(mfrow = c(3,4))
+qqplot_excludecovar(n_geno = n_geno, m = 2)
+for(j in 1:10){
+  qqplot_comparision(n_geno, m = 2, n = j)$figure
+}
+# Including 3 PCs is the optimal for phenotype 2
+```
+
+```{r}
+# for phenotype 3
+par(mfrow = c(3,4))
+qqplot_excludecovar(n_geno = n_geno, m = 3)
+for(j in 1:10){
+  qqplot_comparision(n_geno, m = 3, n = j)$figure
+}
+# Including 5 PCs is the optimal for phenotype 3
+```
+
+```{r}
+# for phenotype 4
+par(mfrow = c(1,3))
+qqplot_excludecovar(n_geno = n_geno, m = 4)
+for(j in 1:2){
+  qqplot_comparision(n_geno, m = 4, n = j)$figure
+}
+# There was no significant hit for phenotype 4. Here only 2 PCs were tried to decrease the coding running time. QQplots and Manhanttan plots for phenotype 4 with 10PCs will be done in the next chunk of code.
+```
+
+```{r}
+# for phenotype 5
+par(mfrow = c(1,3))
+qqplot_excludecovar(n_geno = n_geno, m = 5)
+for(j in 1:2){
+  qqplot_comparision(n_geno, m = 5, n = j)$figure
+}
+
+# There was no significant hit for phenotype 5. Here only 2 PCs were tried to decrease the coding running time. QQplots and Manhanttan plots for phenotype 5 with 10PCs will be done in the next chunk of code.
+```
+
+```{r}
+#3. Do the final qqplot and Manhantten plot
+# for the qqplots
+par(mfrow=c(2,3))
+pvalue_LRM_1 <- qqplot_comparision(n_geno, m = 1, n = 10)
+pvalue_LRM_1$figure
+pvalue_LRM_2 <- qqplot_comparision(n_geno, m = 2, n = 3)
+pvalue_LRM_2$figure
+pvalue_LRM_3 <- qqplot_comparision(n_geno, m = 3, n = 5)
+pvalue_LRM_3$figure
+pvalue_LRM_4<- qqplot_comparision(n_geno, m = 4, n = 10)
+pvalue_LRM_4$figure
+pvalue_LRM_5 <- qqplot_comparision(n_geno, m = 5, n = 10)
+pvalue_LRM_5$figure
+```
+
+```{r}
+# do the Manhantten plots
+total_test <- ncol(x_filter)*ncol(pheno_input)
+#blue lines indicates doing multiple hypothesis testing correction with (number of test) = (number of genotypes)*(number of phenotypes)
+#red lines indicates doing multiple hypotheis testing correction with number of (number of test) = (number of genotypes)
+
+# Use SNPs that pass the genotype filter
+index_SNP <- match(colnames(x_filter), SNP_input$id)
+SNP_filter <- SNP_input[index_SNP,]
+
+recombined_SNP_info <- function(pvalue_LM) {
+  x<-cbind(SNP_filter, pvalue_LM)
+  colnames(x) <- c("CHR", "BP", "SNP", "P")
+  return(x)
+}
+
+par(mfrow = c(2,3))
+manhattan(recombined_SNP_info(pvalue_LRM_1$pval), suggestiveline = FALSE, genomewideline = FALSE, annotatePval = 0.5/total_test, main = gene_input_order$symbol[1])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pvalue_LRM_2$pval), suggestiveline = FALSE, genomewideline = FALSE, annotatePval = 0.5/total_test, main = gene_input_order$symbol[2])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pvalue_LRM_3$pval), suggestiveline = FALSE, genomewideline = FALSE, annotatePval = 0.5/total_test, main = gene_input_order$symbol[3])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pvalue_LRM_4$pval), suggestiveline = FALSE, genomewideline = FALSE, main = gene_input_order$symbol[4])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pvalue_LRM_5$pval), suggestiveline = FALSE, genomewideline = FALSE,main = gene_input_order$symbol[5])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+```
+PART III Do an association test with linear mixed model
+```{r}
+#1. Use EMMAX function
+# citation of the coding for function EMMAX:
+#https://github.com/Gregor-Mendel-Institute/mlmm/blob/master/misc/emmax.r
+#PHENOTYPE - Y: a vector of length n with names(Y)=ecotype names
+#GENOTYPE - X: a n by m matrix, where n=number of ecotypes, m=number of markers, with rownames(X)=ecotype names, and colnames(X)=SNP names
+#KINSHIP - K: a n by n matrix, with rownames(K)=colnames(K)=ecotype names
+#nbchunks: an integer defining the number of chunks of X to run the analysis, allows to decrease the memory usage ==> minimum=2, increase it if you do not have enough memory 
+
+library(emma)
+library(mlmm)
+emmax<-function(Y,X,K,nbchunks) {
+  
+  n<-length(Y)
+  m<-ncol(X)
+  
+  stopifnot(ncol(K) == n)
+  stopifnot(nrow(K) == n)
+  stopifnot(nrow(X) == n)
+  stopifnot(nbchunks >= 2)
+  
+  #INTERCEPT
+  
+  Xo<-rep(1,n)
+  
+  #K MATRIX NORMALISATION
+  
+  K_norm<-(n-1)/sum((diag(n)-matrix(1,n,n)/n)*K)*K
+  rm(K)
+  
+  #NULL MODEL
+  
+  null<-emma.REMLE(Y,as.matrix(Xo),K_norm)
+  
+  pseudoh<-null$vg/(null$vg+null$ve)
+  
+  cat('null model done! pseudo-h =',round(pseudoh,3),'\n')
+  
+  library(emma)
+  
+  #EMMAX
+  
+  M<-solve(chol(null$vg*K_norm+null$ve*diag(n)))
+  Y_t<-crossprod(M,Y)
+  Xo_t<-crossprod(M,Xo)
+  
+  RSS<-list()
+  for (j in 1:(nbchunks-1)) {
+    X_t<-crossprod(M,X[,((j-1)*round(m/nbchunks)+1):(j*round(m/nbchunks))])
+    RSS[[j]]<-apply(X_t,2,function(x){sum(lsfit(cbind(Xo_t,x),Y_t,intercept = FALSE)$residuals^2)})
+    rm(X_t)}
+  X_t<-crossprod(M,X[,((j)*round(m/nbchunks)+1):(m)])
+  RSS[[nbchunks]]<-apply(X_t,2,function(x){sum(lsfit(cbind(Xo_t,x),Y_t,intercept = FALSE)$residuals^2)})
+  rm(X_t,j)
+  
+  RSSf<-unlist(RSS)
+  RSS_H0<-rep(sum(lsfit(Xo_t,Y_t,intercept = FALSE)$residuals^2),m)
+  df1<-1
+  df2<-n-df1-1
+  R2<-1-1/(RSS_H0/RSSf)
+  F<-(RSS_H0/RSSf-1)*df2/df1
+  pval<-pf(F,df1,df2,lower.tail=FALSE)
+  
+  cat('EMMAX scan done! \n')
+  
+  cat('creating output','\n')
+  
+  list(output=data.frame(SNP=colnames(X),'F'=F,'pval'=pval,'Rsq'=R2),bonf_thresh=-log10(0.05/m))}
+
+linreg<-function(Y,X,nbchunks) {
+  
+  n<-length(Y)
+  m<-ncol(X)
+  
+  stopifnot(nrow(X) == n)
+  stopifnot(nbchunks >= 2)
+  
+  #INTERCEPT
+  
+  Xo<-rep(1,n)
+  
+  RSS<-list()
+  for (j in 1:(nbchunks-1)) {RSS[[j]]<-apply(X[,((j-1)*round(m/nbchunks)+1):(j*round(m/nbchunks))],2,function(x){sum(lsfit(cbind(Xo,x),Y,intercept=FALSE)$residuals^2)})}
+  RSS[[nbchunks]]<-apply(X[,((j)*round(m/nbchunks)+1):(m)],2,function(x){sum(lsfit(cbind(Xo,x),Y,intercept=FALSE)$residuals^2)})
+  rm(j)
+  
+  RSSf<-unlist(RSS)
+  RSS_H0<-rep(sum(lsfit(Xo,Y,intercept=FALSE)$residuals^2),m)
+  df1<-1
+  df2<-n-df1-1
+  R2<-1-1/(RSS_H0/RSSf)
+  F<-(RSS_H0/RSSf-1)*df2/df1
+  pval<-pf(F,df1,df2,lower.tail=FALSE)
+  
+  cat('linreg scan done! \n')
+  
+  cat('creating output','\n')
+  
+  list(output=data.frame(SNP=colnames(X),'F'=F,'pval'=pval,'Rsq'=R2),bonf_thresh=-log10(0.05/m))}
+```
+
+```{r}
+# 2. Generate the covariance matrix for random effects
+cov_matrix <- matrix(NA, ncol = nrow(pheno_input), nrow = nrow(pheno_input))
+x_filter<- as.matrix(x_filter)
+for(i in 1:nrow(cov_matrix)) {
+  for(j in 1:ncol(cov_matrix)) {
+    cov_matrix[i,j] <- cov(x_filter[i,], x_filter[j,])
+  }
+}
+```
+
+```{r}
+library(pheatmap)
+pheatmap(cov_matrix, legend = T, labels_row = rep('', dim(cov_matrix)[1]),labels_col = rep('', dim(cov_matrix)[1]))
+```
+
+```{r}
+# 3. Do the QQplots
+pValues_includecovar<-matrix(nrow = ncol(pheno_input),ncol = ncol(x_filter))
+
+par(mfrow = c(2, 3))
+for(j in 1:nrow(pValues_includecovar)) {
+  mygwas <- emmax(Y = pheno_input[,j], X = x_filter, K = cov_matrix, nbchunks = 3)
+  pValues_includecovar[j,] <- mygwas$output[['pval']]
+  plot_qq(pval_vec = pValues_includecovar[j,], n_geno, paste("For Phenotype",j, gene_input_order$symbol[j]))
+}
+
+```
+
+```{r}
+#4. Do the Manhatten plots
+#blue lines indicates doing multiple hypothesis testing correction with (number of test) = (number of genotypes)*(number of phenotypes)
+#red lines indicates doing multiple hypotheis testing correction with number of (number of test) = (number of genotypes)
+
+par(mfrow = c(2, 3))
+
+manhattan(recombined_SNP_info(pValues_includecovar[1,]), suggestiveline = FALSE, genomewideline = FALSE, annotatePval = 0.5/total_test, main = gene_input_order$symbol[1])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pValues_includecovar[2,]), suggestiveline = FALSE, genomewideline = FALSE, annotatePval = 0.5/total_test, main = gene_input_order$symbol[2])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pValues_includecovar[3,]), suggestiveline = FALSE, genomewideline = FALSE, annotatePval = 0.5/total_test, main = gene_input_order$symbol[3])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pValues_includecovar[4,]), suggestiveline = FALSE, genomewideline = FALSE, main = gene_input_order$symbol[4])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+manhattan(recombined_SNP_info(pValues_includecovar[5,]), suggestiveline = FALSE, genomewideline = FALSE, main = gene_input_order$symbol[5])
+abline(h=-log10(0.05/n_geno), col='red')
+abline(h=-log10(0.05/total_test), col='blue')
+
+```
+
+PART IV results analysis
+```{r}
+#1. Coding for the LD plots
+library(LDheatmap)
+library(downloader)
+library(rtracklayer)
+library(ggplot2)
+library(snpStats)
+library(plyr)
+library(devtools)
+
+# choose the SNPs that are considered significant hits
+# for linear regression model
+SNPhit_LRM_1 <- SNP_filter[which(pvalue_LRM_1$pval < 0.05/total_test),]
+SNPhit_LRM_1
+SNPhit_LRM_2 <- SNP_filter[which(pvalue_LRM_2$pval < 0.05/total_test),]
+SNPhit_LRM_2
+SNPhit_LRM_3 <- SNP_filter[which(pvalue_LRM_3$pval < 0.05/total_test),]
+SNPhit_LRM_3
+
+#for linear mixed model
+SNPhit_LMM_1 <- SNP_filter[which(pValues_includecovar[1,] < 0.05/total_test),]
+SNPhit_LMM_1
+SNPhit_LMM_2 <- SNP_filter[which(pValues_includecovar[2,] < 0.05/total_test),]
+SNPhit_LMM_2
+SNPhit_LMM_3 <- SNP_filter[which(pValues_includecovar[3,] < 0.05/total_test),]
+SNPhit_LMM_3
+
+# the coding to generate the LD heatmap with the LDheatmap package
+ld_analysis <- function(input, SNP_position, gene_name, model_name) {
+  x_SNP_conv <- as.matrix(x_filter[,which(input < 0.05/total_test)] + 1)
+  x_SNP<- new("SnpMatrix", x_SNP_conv)                                
+  ld <- ld(x_SNP, x_SNP, stats="R.squared") 
+  ll <- LDheatmap(ld, SNP_position, flip=TRUE, name="myLDgrob", title=paste("LD heatmap for gene",gene_name, "with", model_name))
+  return(list(ld, ll))
+}
+```
+
+```{r}
+#2. Generating local Manhatten plots and LD heatmaps for linear regression models
+
+#for phenotype 1, gene ERAP2 expression:
+ld_analysis(pvalue_LRM_1$pval, SNPhit_LRM_1$position, gene_input_order$symbol[1],"LRM")$ll
+
+plot(SNPhit_LRM_1$position, -log10(pvalue_LRM_1$pval[which(pvalue_LRM_1$pval < 0.05/total_test)]), type='p',pch=20,main=paste(),xlab='position (bp)',ylab='-log10(pval)',col='gray40',xlim=c(SNPhit_LRM_1$position[1], SNPhit_LRM_1$position[nrow(SNPhit_LRM_1)]), cex.axis=0.6, las = 2)
+title(main = paste("local Manhattan plot for",gene_input_order$symbol[1], "with LRM"))
+
+#for phenotype 2, gene PEX6 expression:
+# check chromosome number, find the first SNP is on chromosome 4, it's in trans of PEX6, remove the first SNP.
+SNPhit_LRM_2_t <- SNPhit_LRM_2[2:nrow(SNPhit_LRM_2),]
+pvalue_LRM_2_t$pval <- pvalue_LRM_2$pval[2: length(pvalue_LRM_2$pval)]
+
+ld_analysis(pvalue_LRM_2_t$pval, SNPhit_LRM_2_t$position, gene_input_order$symbol[2], "LRM")$ll
+
+plot(SNPhit_LRM_2_t$position, -log10((pvalue_LRM_2_t$pval[which(pvalue_LRM_2_t$pval < 0.05/total_test)])[-1]), type='p',pch=20,main=paste(),xlab='position (bp)',ylab='-log10(pval)',col='gray40',xlim=c(SNPhit_LRM_2_t$position[1], SNPhit_LRM_2_t$position[nrow(SNPhit_LRM_2_t)]), cex.axis=0.6, las = 2)
+title(main = paste("local Manhattan plot for",gene_input_order$symbol[2], "with LRM"))
+
+
+#for phenotype 3, gene FAHD1 expression:
+ld_analysis(pvalue_LRM_3$pval, SNPhit_LRM_3$position, gene_input_order$symbol[3], "LRM")$ll
+
+plot(SNPhit_LRM_3$position, -log10(pvalue_LRM_3$pval[which(pvalue_LRM_3$pval < 0.05/total_test)]), type='p',pch=20,main=paste(),xlab='position (bp)',ylab='-log10(pval)',col='gray40',xlim=c(SNPhit_LRM_3$position[1], SNPhit_LRM_3$position[nrow(SNPhit_LRM_3)]), cex.axis=0.6, las = 2)
+title(main = paste("local Manhattan plot for",gene_input_order$symbol[3], "with LRM"))
+
+```
+
+```{r}
+#3. Generating local Manhatten plots and LD heatmaps for linear mixed models
+
+#for phenotype 1, gene ERAP2 expression:
+ld_analysis(pValues_includecovar[1,], SNPhit_LMM_1$position, gene_input_order$symbol[1], "LMM")$ll
+
+plot(SNPhit_LMM_1$position, -log10(pValues_includecovar[1,][which(pValues_includecovar[1,] < 0.05/total_test)]), type='p',pch=20,main=paste(),xlab='position (bp)',ylab='-log10(pval)',col='gray40',xlim=c(SNPhit_LMM_1$position[1], SNPhit_LMM_1$position[nrow(SNPhit_LMM_1)]), cex.axis=0.6, las = 2)
+title(main = paste("local Manhattan plot for",gene_input_order$symbol[1], "with LMM"))
+
+
+#for phenotype 2, gene PEX6 expression:
+ld_analysis(pValues_includecovar[2,], SNPhit_LMM_2$position, gene_input_order$symbol[2], "LMM")$ll
+
+plot(SNPhit_LMM_2$position, -log10(pValues_includecovar[2,][which(pValues_includecovar[2,] < 0.05/total_test)]), type='p',pch=20,main=paste(),xlab='position (bp)',ylab='-log10(pval)',col='gray40',xlim=c(SNPhit_LMM_2$position[1], SNPhit_LMM_2$position[nrow(SNPhit_LMM_2)]), cex.axis=0.6, las = 2)
+title(main = paste("local Manhattan plot for",gene_input_order$symbol[2], "with LMM"))
+
+
+#for phenotype 3, gene FAHD1 expression:
+ld_analysis(pValues_includecovar[3,], SNPhit_LMM_3$position, gene_input_order$symbol[3], "LMM")$ll
+
+plot(SNPhit_LMM_3$position, -log10(pValues_includecovar[3,][which(pValues_includecovar[3,] < 0.05/total_test)]), type='p',pch=20,main=paste(),xlab='position (bp)',ylab='-log10(pval)',col='gray40',xlim=c(SNPhit_LMM_3$position[3], SNPhit_LMM_3$position[nrow(SNPhit_LMM_3)]), cex.axis=0.6, las = 2)
+title(main = paste("local Manhattan plot for",gene_input_order$symbol[3],"with LMM"))
+
+
+# Further discussion includes searching for the genes that located within the SNPs with significant p-values with Genome Browser, and analysis of the genes with literature searching.
+```
+```{r}
+# 4. Find the positions of the significant SNP hits and the genes within it.
+
+# use the biomaRt package to find genes within the region of the significant SNP.
+library(biomaRt)
+mart <- useMart("ensembl")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+attributes <- c("ensembl_gene_id","start_position","end_position","strand","hgnc_symbol","chromosome_name","entrezgene","ucsc","band")
+filters <- c("chromosome_name","start","end")
+
+# write a function to determine the value input for the function getBM
+# Within 1000bp on either side of an SNP is considered 'in cis'
+value_for_biomaRt <- function(SNP_hit) {
+  chromo <- unique(SNP_hit$chromosome) 
+  if(length(chromo) !=1) {
+    return(print("check chromosome numbers"))
+  }else{
+    start <- (SNP_hit$position[1]-1000)
+    end <- (SNP_hit$position[length(SNP_hit$position)]+1000)
+    values <- list(chromosome = as.character(chromo), start = as.character(start), end = as.character((end)))
+  }
+}
+```
+
+```{r}
+# for ERAP2 (phenotype 1)
+value_LRM_1 <- value_for_biomaRt(SNPhit_LRM_1)
+gene_info_LRM_1 <- getBM(attributes=attributes, filters=filters, values=value_LRM_1, mart=mart)
+genelist_LRM_1 <- unique(gene_info_LRM_1$hgnc_symbol) [unique(gene_info_LRM_1$hgnc_symbol) != ""]
+print(paste("With LRM, the significant SNPs for gene",gene_input_order$symbol[1],"are located on chromosome", unique(SNPhit_LRM_1$chromosome),":", SNPhit_LRM_1$position[1], "-", SNPhit_LRM_1$position[nrow(SNPhit_LRM_1)]))
+print(paste(length(genelist_LRM_1), "genes are located within the region that contains a true causal polymorphism:"))
+print(genelist_LRM_1)
+
+cat('..........................................................................................')
+
+value_LMM_1 <- value_for_biomaRt(SNPhit_LMM_1)
+gene_info_LMM_1 <- getBM(attributes=attributes, filters=filters, values=value_LMM_1, mart=mart)
+genelist_LMM_1 <- unique(gene_info_LMM_1$hgnc_symbol) [unique(gene_info_LMM_1$hgnc_symbol) != ""]
+print(paste("With LMM, the significant SNPs for gene",gene_input_order$symbol[1],"are located on chromosome", unique(SNPhit_LMM_1$chromosome),":", SNPhit_LMM_1$position[1], "-", SNPhit_LMM_1$position[nrow(SNPhit_LMM_1)]))
+print(paste(length(genelist_LMM_1), "genes are located within the region that contains a true causal polymorphism:"))
+print(genelist_LMM_1)
+
+```
+```{r}
+# for PEX6 (phenotype2)
+value_LRM_2 <- value_for_biomaRt(SNPhit_LRM_2)
+
+# check chromosome number, find one SNP on chromosome 4, it's in trans of PEX6, remove the element.
+SNPhit_LRM_2_t <- SNPhit_LRM_2[2:nrow(SNPhit_LRM_2),]
+value_LRM_2 <- value_for_biomaRt(SNPhit_LRM_2_t)
+gene_info_LRM_2 <- getBM(attributes=attributes, filters=filters, values=value_LRM_2, mart=mart)
+genelist_LRM_2 <- unique(gene_info_LRM_2$hgnc_symbol) [unique(gene_info_LRM_2$hgnc_symbol) != ""]
+print(paste("With LRM, the significant SNPs for gene",gene_input_order$symbol[2],"are located on chromosome", unique(SNPhit_LRM_2_t$chromosome),":", SNPhit_LRM_2_t$position[1], "-", SNPhit_LRM_2_t$position[nrow(SNPhit_LRM_2_t)]))
+print(paste(length(genelist_LRM_2), "genes are located within the region that contains a true causal polymorphism:"))
+print(genelist_LRM_2)
+
+cat('..........................................................................................')
+
+value_LMM_2 <- value_for_biomaRt(SNPhit_LMM_2)
+gene_info_LMM_2 <- getBM(attributes=attributes, filters=filters, values=value_LMM_2, mart=mart)
+genelist_LMM_2 <- unique(gene_info_LMM_2$hgnc_symbol) [unique(gene_info_LMM_2$hgnc_symbol) != ""]
+print(paste("With LMM, the significant SNPs for gene",gene_input_order$symbol[2],"are located on chromosome", unique(SNPhit_LMM_2$chromosome),":", SNPhit_LMM_2$position[1], "-", SNPhit_LMM_2$position[nrow(SNPhit_LMM_2)]))
+print(paste(length(genelist_LMM_2), "genes are located within the region that contains a true causal polymorphism:"))
+print(genelist_LMM_2)
+```
+
+```{r}
+# for FAHD1 (phenotype 3)
+value_LRM_3 <- value_for_biomaRt(SNPhit_LRM_3)
+gene_info_LRM_3 <- getBM(attributes=attributes, filters=filters, values=value_LRM_3, mart=mart)
+genelist_LRM_3 <- unique(gene_info_LRM_3$hgnc_symbol) [unique(gene_info_LRM_3$hgnc_symbol) != ""]
+print(paste("With LRM, the significant SNPs for gene",gene_input_order$symbol[3],"are located on chromosome", unique(SNPhit_LRM_3$chromosome),":", SNPhit_LRM_3$position[1], "-", SNPhit_LRM_3$position[nrow(SNPhit_LRM_3)]))
+print(paste(length(genelist_LRM_3), "genes are located within the region that contains a true causal polymorphism:"))
+print(genelist_LRM_3)
+
+cat('..........................................................................................')
+
+value_LMM_3 <- value_for_biomaRt(SNPhit_LMM_3)
+gene_info_LMM_3 <- getBM(attributes=attributes, filters=filters, values=value_LMM_3, mart=mart)
+genelist_LMM_3 <- unique(gene_info_LMM_3$hgnc_symbol) [unique(gene_info_LMM_3$hgnc_symbol) != ""]
+print(paste("With LMM, the significant SNPs for gene",gene_input_order$symbol[3],"are located on chromosome", unique(SNPhit_LMM_3$chromosome),":", SNPhit_LMM_3$position[1], "-", SNPhit_LMM_3$position[nrow(SNPhit_LMM_3)]))
+print(paste(length(genelist_LMM_3), "genes are located within the region that contains a true causal polymorphism:"))
+print(genelist_LMM_3)
+```
